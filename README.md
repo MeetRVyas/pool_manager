@@ -33,14 +33,23 @@ print(llm.usage_report())                          # which model/key got how muc
 `configs/model_limits.yaml` records limits enforced **per endpoint**. Google quotas are
 per project: two keys in one project do not add capacity. The catalogue was reviewed on
 2026-10-26 against [Google's rate-limit documentation](https://ai.google.dev/gemini-api/docs/rate-limits).
-Active RPM/TPM/RPD values depend on the project/tier and must be copied from AI Studio;
-unverified historical numbers have been removed. Until those values are supplied, the pool
-handles 429s reactively. For example:
+Active RPM/TPM/RPD values depend on the project/tier. The project owner supplied the
+following AI Studio quotas on 2026-10-26; the two keys belong to separate projects.
+Configured RPM and RPD reserve two requests below each upstream request quota:
+
+| Model | Upstream RPM / RPD | Configured RPM / RPD | TPM |
+|---|---:|---:|---:|
+| 3.5 Flash (routes to 3.6) | 5 / 20 | 3 / 18 | 250,000 |
+| 3.5 Flash-Lite | 15 / 500 | 13 / 498 | 250,000 |
+
+The catalogue also recognizes the 3.6 Flash alias with the same caps. Avoid configuring
+both Flash aliases together: they share upstream capacity. Other models have no verified
+numeric quotas and use reactive handling. The active entries are:
 
 ```yaml
 google:
-  gemini-3.5-flash: {daily_reset: midnight_pt}  # add your verified rpm/tpm/rpd
-  gemini-3.5-flash-lite: {daily_reset: midnight_pt}
+  gemini-3.5-flash: {rpm: 3, tpm: 250000, rpd: 18, daily_reset: midnight_pt}
+  gemini-3.5-flash-lite: {rpm: 13, tpm: 250000, rpd: 498, daily_reset: midnight_pt}
 ```
 
 * Model with numeric limits -> pre-stopped at its limit; the pool moves to the next model/key *before* a 429.
@@ -50,6 +59,9 @@ google:
   a model's catalogue entry overrides them field by field.
 * Typos / bad values in the limits file fail at startup. `safety_margin=0.1` pre-stops at 90%.
 * Context-window limits are per request and must not be used as TPM quotas.
+* The request headroom is already included in these numbers; default `safety_margin=0.0`
+  avoids reducing them again. Waiting near capacity can increase p95 latency, while avoiding
+  provider retries can reduce it; the result depends on load and provider behavior.
 
 ## How a call is handled
 

@@ -157,8 +157,9 @@ Its raw results are separate from the simulation data above.
 
 The CLI loads `.env` without overriding existing environment variables; use `--env-file`
 to select another file. The supplied config uses `GEMINI_API_KEY` and `GEMINI_API_KEY2`
-with Gemini 3.5 Flash / Flash-Lite. Numeric quotas must come from your project's AI Studio
-page; see `configs/model_limits.yaml` for the verification sources and scope.
+with Gemini 3.5 Flash / Flash-Lite. The catalogue uses owner-supplied AI Studio quotas
+with two requests of headroom on RPM and RPD; see `configs/model_limits.yaml` for sources
+and scope. The recorded 2026-10-26 live run predates these proactive caps.
 
 ```bash
 python -m evals.live_eval --config configs/llm_config.yaml --dry-run                      # checks keys/limits, sends nothing
