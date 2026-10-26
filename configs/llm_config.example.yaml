@@ -1,0 +1,19 @@
+# Example llm_config (pass its path to get_llm). One block per provider.
+#
+#   models  ORDER MATTERS: first = preferred. The pool uses the first model while it has
+#           headroom (per configs/model_limits.yaml) and only then moves to the next.
+#   keys    NAMES of environment variables that hold API keys (never the keys themselves).
+#           Every key is used for every model; load is rotated across keys.
+
+google:
+  models: [gemini-3.5-flash, gemini-3.5-flash-lite]   # primary, then fallback
+  keys: [GEMINI_API_KEY1, GEMINI_API_KEY2]
+  # timeout: 120            # optional per-request timeout (seconds) for this provider
+  # rpm_limit: 5            # optional provider-wide DEFAULT limits (the old v3 style);
+  # rpd_limit: 20           #   a model's entry in model_limits.yaml overrides these
+
+# An OpenAI-compatible fallback provider (anything that isn't google/gemini uses ChatOpenAI)
+# groq:
+#   base_url: https://api.groq.com/openai/v1
+#   models: [llama-3.3-70b-versatile]
+#   keys: [GROQ_API_KEY_1]

@@ -1,0 +1,36 @@
+# Model rate-limit catalogue. Reviewed 2026-10-26.
+# Sources:
+#   https://ai.google.dev/gemini-api/docs/rate-limits
+#   https://ai.google.dev/gemini-api/docs/models/gemini-3.5-flash
+#   https://ai.google.dev/gemini-api/docs/models/gemini-3.5-flash-lite
+#   https://developers.openai.com/api/docs/guides/rate-limits
+#
+# RPM/TPM/RPD depend on the project's tier and active quota. The previous
+# illustrative numbers cannot be verified for these keys, so they are omitted.
+# Fill in positive integer rpm/tpm/rpd values from your provider's quota page.
+# Omitted dimensions use reactive 429 handling, not an invented quota.
+# Gemini's 1,048,576 input / 65,536 output context limits are per request;
+# they are NOT tokens-per-minute quotas and do not belong in tpm.
+#
+# Counters here are PER ENDPOINT (model/key). Google enforces quota PER PROJECT;
+# keys in the same project share capacity. RPD resets at midnight Pacific time.
+# Matching: exact name, most specific glob, provider '*', then '*' provider.
+
+google:
+  # Requested model ID retained; Google documents routing it to 3.6 Flash.
+  gemini-3.5-flash:
+    daily_reset: midnight_pt
+  gemini-3.5-flash-lite:
+    daily_reset: midnight_pt
+  gemini-2.5-pro:
+    daily_reset: midnight_pt
+  gemini-2.5-flash:
+    daily_reset: midnight_pt
+  gemini-2.5-flash-lite:
+    daily_reset: midnight_pt
+  "gemini-*":
+    daily_reset: midnight_pt
+
+openai:
+  # Organization/project/tier-specific; set verified values before pre-limiting.
+  gpt-4o-mini: {}

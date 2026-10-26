@@ -1,0 +1,7 @@
+langchain-core
+langchain-openai
+langchain-google-genai
+pyyaml
+python-dotenv
+tzdata
+pytest
