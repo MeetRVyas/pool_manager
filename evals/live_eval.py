@@ -72,7 +72,7 @@ LIVE_KEYS = (  # the subset of metrics.summarize that is meaningful without prov
 class Plan:
     calls: int = 60
     rate_per_min: float = 90.0
-    pattern: str = "poisson"          # poisson | burst
+    pattern: str = "poisson"          # poisson | paced | burst
     seed: int = 1
     prompt: str = "Reply with exactly one word: ok"
     max_wait: float = 60.0            # the pool's max_wait_seconds
@@ -85,6 +85,10 @@ def arrivals(plan: Plan) -> list[float]:
     rng = random.Random(f"live|{plan.pattern}|{plan.seed}")
     if plan.pattern == "burst":
         return sorted(rng.uniform(0.0, 1.0) for _ in range(plan.calls))
+    if plan.pattern == "paced":
+        if plan.rate_per_min <= 0:
+            raise ValueError("paced arrivals require a positive rate")
+        return [i * (60.0 / plan.rate_per_min) for i in range(plan.calls)]
     if plan.pattern != "poisson":
         raise ValueError(f"unknown pattern {plan.pattern!r}")
     rate = plan.rate_per_min / 60.0
@@ -174,9 +178,29 @@ def summarize_live(results: list, stats: list[dict]) -> dict:
 
 async def run_mode(mode: str, config: str | Path, plan: Plan, *, clock: Optional[Callable[[], float]] = None) -> dict:
     target = build_target(mode, config, plan, clock=clock)
-    results = await _drive(target.call, arrivals(plan))
+    # _drive expects absolute event-loop times; arrivals() returns offsets.
+    # Real monotonic clocks are already far past these small offsets.
+    origin = asyncio.get_running_loop().time()
+    active = peak = 0
+
+    async def observed_call(i: int) -> Any:
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        try:
+            return await target.call(i)
+        finally:
+            active -= 1
+
+    results = await _drive(observed_call, [origin + offset for offset in arrivals(plan)])
     out = summarize_live(results, target.stats())
     out["target"] = target.name
+    out["max_concurrent_calls"] = peak
+    out["calls"] = [
+        {"id": r.i, "arrival_offset_s": r.t_arrival - origin,
+         "latency_s": r.latency, "outcome": r.outcome}
+        for r in sorted(results, key=lambda r: r.i)
+    ]
     return out
 
 
@@ -220,7 +244,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--mode", choices=MODES, default="pool")
     ap.add_argument("--calls", type=int, default=60)
     ap.add_argument("--rate-per-min", type=float, default=90.0, help="offered load; pick a value ABOVE one key's limit to see a difference")
-    ap.add_argument("--pattern", choices=("poisson", "burst"), default="poisson")
+    ap.add_argument("--pattern", choices=("poisson", "paced", "burst"), default="poisson")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--max-wait", type=float, default=60.0, help="the pool's max_wait_seconds")
     ap.add_argument("--timeout", type=float, default=60.0, help="per-request timeout")
@@ -248,7 +272,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"config problem: {exc}", file=sys.stderr)
         return 2
     print(pm.describe_endpoints(endpoints))
-    span = plan.calls / (plan.rate_per_min / 60.0) if plan.pattern == "poisson" else 1.0
+    span = plan.calls / (plan.rate_per_min / 60.0) if plan.pattern in ("poisson", "paced") else 1.0
     print(f"\nplan: {plan.calls} calls, {plan.pattern}, ~{plan.rate_per_min:.0f}/min (about {span:.0f}s), modes: {', '.join(modes)}")
     if args.dry_run:
         print("dry run: nothing was sent.")

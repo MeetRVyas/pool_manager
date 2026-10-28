@@ -7,3 +7,5 @@ __pycache__/
 .pytest_tmp_final/
 pool_eval_*/
 *.pyc
+output/
+files.zip

@@ -5,6 +5,7 @@ plumbing that builds the pool / the single-key baseline, and the arithmetic of t
 "provider" here is the evaluation harness's rate-limit-enforcing fake, driven on virtual time.
 """
 import functools
+import asyncio
 import os
 import random
 
@@ -18,6 +19,35 @@ from evals.provider import CallCtx, FakeGemini, World
 from evals.scenarios import MODELS, N_KEYS, Scenario
 
 SCN = Scenario("live-test", "", rho=1.0)
+
+
+def test_real_loop_honors_arrival_offsets_instead_of_sending_every_call_at_once(monkeypatch):
+    async def check():
+        observed = []
+        loop = asyncio.get_running_loop()
+        async def call(i):
+            observed.append(loop.time())
+        monkeypatch.setattr(live_eval, "build_target", lambda *a, **kw: live_eval.Target("timing", call, lambda: []))
+        monkeypatch.setattr(live_eval, "arrivals", lambda plan: [0.02, 0.04])
+        started = loop.time()
+        metrics = await live_eval.run_mode("pool", "unused", live_eval.Plan(calls=2))
+        assert metrics["success_rate"] == 1.0
+        assert observed[0] - started >= 0.02
+        assert observed[1] - started >= 0.04
+    asyncio.run(check())
+
+
+def test_live_run_records_overlapping_calls_and_each_latency(monkeypatch):
+    async def check():
+        async def call(i):
+            await asyncio.sleep(0.01)
+        monkeypatch.setattr(live_eval, "build_target", lambda *a, **kw: live_eval.Target("overlap", call, lambda: []))
+        monkeypatch.setattr(live_eval, "arrivals", lambda plan: [0, 0, 0])
+        metrics = await live_eval.run_mode("pool", "unused", live_eval.Plan(calls=3))
+        assert metrics["max_concurrent_calls"] == 3
+        assert [r["id"] for r in metrics["calls"]] == [0, 1, 2]
+        assert all(r["outcome"] == "ok" and r["latency_s"] >= 0.01 for r in metrics["calls"])
+    asyncio.run(check())
 
 
 @pytest.fixture(autouse=True)
@@ -68,6 +98,17 @@ def test_poisson_arrivals_have_the_requested_mean_rate():
 def test_burst_arrivals_land_within_one_second():
     t = live_eval.arrivals(live_eval.Plan(calls=50, pattern="burst"))
     assert len(t) == 50 and max(t) <= 1.0
+
+
+def test_paced_arrivals_keep_a_fixed_rate_without_poisson_bursts():
+    plan = live_eval.Plan(calls=1400, rate_per_min=36, pattern="paced")
+    times = live_eval.arrivals(plan)
+    assert len(times) == 1400 and times[0] == 0
+    assert times[-1] == pytest.approx(2331.6666666667)
+    assert all(b - a == pytest.approx(60 / 36) for a, b in zip(times, times[1:]))
+    assert times == live_eval.arrivals(live_eval.Plan(calls=1400, rate_per_min=36, pattern="paced", seed=999))
+    with pytest.raises(ValueError):
+        live_eval.arrivals(live_eval.Plan(pattern="paced", rate_per_min=0))
 
 
 def test_unknown_pattern_is_rejected():
