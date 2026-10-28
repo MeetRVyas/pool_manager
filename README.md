@@ -7,6 +7,12 @@ and dead keys by switching endpoints instead of waiting or crashing.
 Base: `pool_manager3`. From `pool_manager2`: the benchmark tracker (latency/tokens/cost).
 `pool_manager1` was an older subset of v3 and contributed nothing new.
 
+Start with the [final metrics and sharing guide](docs/final_metrics.md) for measured results and the minimal evidence files.
+
+The [engineering case study](docs/project_case_study.md) documents the issues, fixes,
+simulation gains, live experiments, latency diagnosis, and known limits. A
+historical PDF may exist locally under `output/pdf/`; it predates the final results and is excluded from version control. Use the Markdown documents for current findings.
+
 ## Quick start
 
 Install dependencies with `python -m pip install -r requirements.txt`.
@@ -26,30 +32,29 @@ print(llm.usage_report())                          # which model/key got how muc
 
 `configs/llm_config.yaml` — **order of `models` is the preference order** (see `llm_config.example.yaml`).
 
-`configs/llm_config.yaml` selects Gemini 3.5 Flash followed by 3.5 Flash-Lite, using
-`GEMINI_API_KEY` and `GEMINI_API_KEY2`. Google currently documents that 3.5 Flash routes to
-3.6 Flash; the requested 3.5 model ID is retained.
+`configs/llm_config.yaml` selects Gemini 3.5 Flash-Lite followed by 3.1 Flash-Lite,
+using `GEMINI_API_KEY` and `GEMINI_API_KEY2`. Flash is excluded from the active pool.
 
 `configs/model_limits.yaml` records limits enforced **per endpoint**. Google quotas are
 per project: two keys in one project do not add capacity. The catalogue was reviewed on
 2026-10-26 against [Google's rate-limit documentation](https://ai.google.dev/gemini-api/docs/rate-limits).
 Active RPM/TPM/RPD values depend on the project/tier. The project owner supplied the
-following AI Studio quotas on 2026-10-26; the two keys belong to separate projects.
-Configured RPM and RPD reserve two requests below each upstream request quota:
+3.5 quotas on 2026-10-26; the keys belong to separate projects. The owner requested
+the same local caps for 3.1 Flash-Lite; its actual project quotas remain unverified:
 
 | Model | Upstream RPM / RPD | Configured RPM / RPD | TPM |
 |---|---:|---:|---:|
-| 3.5 Flash (routes to 3.6) | 5 / 20 | 3 / 18 | 250,000 |
-| 3.5 Flash-Lite | 15 / 500 | 13 / 498 | 250,000 |
+| 3.5 Flash-Lite | 15 / 500 | 12 / 490 | 250,000 |
+| 3.1 Flash-Lite | unverified | 12 / 490 | 250,000 |
 
-The catalogue also recognizes the 3.6 Flash alias with the same caps. Avoid configuring
-both Flash aliases together: they share upstream capacity. Other models have no verified
-numeric quotas and use reactive handling. The active entries are:
+The catalogue retains inactive Flash entries for existing callers; 3.5 Flash routes
+to 3.6 Flash and those aliases should not be counted as independent capacity.
+The active entries are:
 
 ```yaml
 google:
-  gemini-3.5-flash: {rpm: 3, tpm: 250000, rpd: 18, daily_reset: midnight_pt}
-  gemini-3.5-flash-lite: {rpm: 13, tpm: 250000, rpd: 498, daily_reset: midnight_pt}
+  gemini-3.5-flash-lite: {rpm: 12, tpm: 250000, rpd: 490, daily_reset: midnight_pt}
+  gemini-3.1-flash-lite: {rpm: 12, tpm: 250000, rpd: 490, daily_reset: midnight_pt}
 ```
 
 * Model with numeric limits -> pre-stopped at its limit; the pool moves to the next model/key *before* a 429.
@@ -64,6 +69,12 @@ google:
   provider retries can reduce it; the result depends on load and provider behavior.
 
 ## How a call is handled
+
+Within each call, retries prefer eligible endpoints that have not yet been attempted.
+Provider/model priority and key rotation apply within that group, so an expired cooldown
+cannot keep bouncing a call between failed primary keys while a healthy fallback is ready.
+An attempted endpoint can still be reused when no untried endpoint is eligible, subject
+to the attempt cap and wait budget. Each new call starts with normal model preference.
 
 | Situation | What happens |
 |---|---|
@@ -107,6 +118,19 @@ and a per-request `timeout` is set, so the pool sees failures immediately and a 
 * Daily `midnight_pt` needs tz data (`pip install tzdata` on Windows), otherwise falls back to fixed UTC-8.
 
 ## Evaluation
+
+The [final 1,900-call run at 48/minute](evals/results/LIVE_2026-10-28_PACED_1900_48RPM.md) completed **1,807/1,900 (95.1%)**, with p50 17.218s, p95 64.868s, p99 101.317s and zero provider 429s. All 93 failures were local exhaustion outcomes; no daily cap was reached. Equal offered and configured RPM leaves no retry/cooldown capacity. This operating-boundary result complements the spare-capacity soak below.
+
+The maintained [engineering case study](docs/project_case_study.md) documents the findings,
+fixes and evidence. Use the [fresh-key PowerShell runbook](docs/live_eval_runbook.md) for
+the prepared 1,000-call soak and later 100-call timeout comparisons. The wrapper defaults
+to offline preparation; only `-Run` sends live requests. The [first 1,000-call soak](evals/results/LIVE_2026-10-27_SOAK.md)
+completed 1,000/1,000 calls at 30/minute, with p50 1.033s and p95 7.918s.
+The [subsequent small suite](evals/results/LIVE_2026-10-27_SMALL_SUITE.md) completed
+212/212 callers across the fresh 30s timeout rerun, a single-model workload with spare
+minute capacity, and a Flash routing smoke test. A [1,900-call revision of the planned overload test](evals/results/LIVE_2026-10-27_OVERLOAD_1900.md)
+completed at 60/minute against 48 configured RPM: 1,180 successes, 720 exhaustion outcomes,
+zero provider 429s and p95 72.489s. This documents the overload tradeoff, not an optimal safety margin.
 
 `evals/` holds a deterministic **simulated** load test (virtual-time event loop, a provider model that enforces per-key rate limits, 30 paired
 seeds, bootstrap intervals) plus `live_eval.py` for measuring real traffic with your own keys. Start with
