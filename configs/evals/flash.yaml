@@ -1,0 +1,5 @@
+# Optional small model-diversity test. Never run before a fresh-key soak.
+# 3.5 Flash already routes to 3.6; use the current ID without counting aliases twice.
+google:
+  models: [gemini-3.6-flash, gemini-3.5-flash-lite]
+  keys: [GEMINI_API_KEY, GEMINI_API_KEY2]

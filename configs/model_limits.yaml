@@ -9,7 +9,7 @@
 #   Flash (3.5/3.6): 5 RPM, 250000 TPM, 20 RPD.
 #   Flash-Lite:     15 RPM, 250000 TPM, 500 RPD.
 # The two keys belong to separate projects with these quotas.
-# Configured request caps reserve TWO requests in each minute/day quota;
+# Configured request caps reserve headroom below the supplied request quotas;
 # TPM is the supplied quota, without a token margin. Do not also apply
 # safety_margin unless you intentionally want additional headroom.
 # Other models' active quotas remain unverified and are omitted.
@@ -25,18 +25,25 @@
 google:
   # Requested model ID retained; Google documents routing it to 3.6 Flash.
   gemini-3.5-flash:
-    rpm: 3
+    rpm: 4
     tpm: 250000
     rpd: 18
     daily_reset: midnight_pt
   gemini-3.5-flash-lite:
-    rpm: 13
+    rpm: 12
     tpm: 250000
-    rpd: 498
+    rpd: 490
+    daily_reset: midnight_pt
+  # Owner requested the same local caps as 3.5 Flash-Lite for this experiment.
+  # Actual 3.1 project quotas have not been independently verified in AI Studio.
+  gemini-3.1-flash-lite:
+    rpm: 12
+    tpm: 250000
+    rpd: 490
     daily_reset: midnight_pt
   # Same upstream Flash quota; do not configure both aliases as independent capacity.
   gemini-3.6-flash:
-    rpm: 3
+    rpm: 4
     tpm: 250000
     rpd: 18
     daily_reset: midnight_pt

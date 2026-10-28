@@ -1,0 +1,8 @@
+# Local experimental caps, matching the earlier measurements.
+# Confirm actual project quotas in AI Studio before live use.
+# 3.1 quotas remain unverified; identical Lite caps were requested by the owner.
+# Google quotas are per project. Keys must belong to separate projects for capacity to add.
+google:
+  gemini-3.5-flash-lite: {rpm: 12, tpm: 250000, rpd: 490, daily_reset: midnight_pt}
+  gemini-3.1-flash-lite: {rpm: 12, tpm: 250000, rpd: 490, daily_reset: midnight_pt}
+  gemini-3.6-flash: {rpm: 4, tpm: 250000, rpd: 18, daily_reset: midnight_pt}

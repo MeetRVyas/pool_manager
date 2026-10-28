@@ -1,0 +1,5 @@
+# Owner-supplied upstream limits, used only by the single-model evaluation profiles.
+# Two fresh projects provide exactly 1,000 daily attempts: retries use that budget too.
+# These are configured allowances, not a query of remaining provider quota.
+google:
+  gemini-3.5-flash-lite: {rpm: 15, tpm: 250000, rpd: 500, daily_reset: midnight_pt}

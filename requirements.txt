@@ -3,5 +3,6 @@ langchain-openai
 langchain-google-genai
 pyyaml
 python-dotenv
+httpx
 tzdata
 pytest
