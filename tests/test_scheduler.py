@@ -73,6 +73,53 @@ def test_primary_model_is_preferred_again_once_its_window_reopens():
     assert set(counts) == {f"google:flash:{k}" for k in KEYS}
 
 
+@pytest.mark.parametrize("rpm,rpd", [(4, 18), (12, 490)])
+def test_daily_capped_endpoint_is_reconsidered_at_pacific_midnight(rpm, rpd):
+    from datetime import datetime, timedelta, timezone
+
+    ft = FakeTime(start=0.0)
+    start = datetime(2026, 10, 26, 12, tzinfo=timezone.utc)
+    reset = (datetime(2026, 10, 27, 7, tzinfo=timezone.utc) - start).total_seconds()
+    ep = make_ep("google:model:KEY", rpm_limit=rpm, rpd_limit=rpd,
+                 daily_reset="midnight_pt", wall_clock=lambda: start + timedelta(seconds=ft.t))
+    sched = make_scheduler([ep], ft, max_wait_seconds=61)
+
+    # Fill the daily allowance through the scheduler, including its minute waits.
+    take(sched, rpd)
+    assert ep.calls == rpd
+    assert ft.t >= 60 * ((rpd - 1) // rpm)
+    with pytest.raises(AllEndpointsExhausted) as err:
+        sched.acquire_sync(0)
+    assert err.value.retry_after == pytest.approx(reset - ft.t)
+
+    ft.t = reset - 0.001
+    assert ep.try_reserve(ft.t) is False
+    ft.t = reset
+    chosen, waited = sched.acquire_sync(0)
+    assert chosen is ep and waited == 0
+    assert ep.snapshot(ft.t)["rpd_used"] == 1
+    ep.release()
+
+
+def test_provider_daily_429_is_not_retried_until_pacific_reset_plus_pad():
+    from datetime import datetime, timedelta, timezone
+
+    ft = FakeTime(start=0.0)
+    start = datetime(2026, 10, 26, 12, tzinfo=timezone.utc)
+    reset = 19 * 3600.0  # midnight PDT on Oct 27 is 07:00 UTC
+    ep = make_ep("google:model:KEY", daily_reset="midnight_pt",
+                 wall_clock=lambda: start + timedelta(seconds=ft.t))
+    sched = make_scheduler([ep], ft)
+    assert ep.mark_rate_limited(ft.t, retry_after=30, quota_exhausted=True) == reset + 1
+    ft.t = reset
+    with pytest.raises(AllEndpointsExhausted):
+        sched.acquire_sync(0)
+    ft.t = reset + 1
+    chosen, waited = sched.acquire_sync(0)
+    assert chosen is ep and waited == 0
+    ep.release()
+
+
 def test_a_cooling_down_primary_is_skipped_without_waiting():
     ft = FakeTime()
     eps = grid()
@@ -81,6 +128,19 @@ def test_a_cooling_down_primary_is_skipped_without_waiting():
         ep.mark_rate_limited(ft.now(), retry_after=30)
     counts = take(sched, 3)
     assert all(":lite:" in k for k in counts) and ft.sleeps == []
+
+
+@pytest.mark.parametrize("strategy", ["priority", "balanced"])
+def test_attempted_preference_does_not_wait_for_a_blocked_untried_endpoint(strategy):
+    ft = FakeTime()
+    ready = make_ep("google:flash:KEY_1", priority=0)
+    blocked = make_ep("google:lite:KEY_1", priority=1)
+    blocked.mark_rate_limited(ft.now(), quota_exhausted=True)
+    sched = make_scheduler([ready, blocked], ft, strategy=strategy)
+    chosen, waited = sched.acquire_sync(0, attempted={ready.id})
+    assert chosen is ready and waited == 0
+    assert ft.sleeps == []
+    chosen.release()
 
 
 # --------------------------------------------------------------- bounded waiting

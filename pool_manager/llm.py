@@ -266,15 +266,19 @@ def run_with_failover_sync(
     max_attempts = max(1, max_attempts)
     last_exc: Optional[BaseException] = None
     tried: list[str] = []
+    attempted: set[str] = set()
     waited_total = 0.0
     for _ in range(max_attempts):
         try:
-            ep, waited = scheduler.acquire_sync(max(0.0, scheduler.max_wait_seconds - waited_total))
+            ep, waited = scheduler.acquire_sync(
+                max(0.0, scheduler.max_wait_seconds - waited_total), attempted=attempted,
+            )
         except AllEndpointsExhausted as exc:
             if last_exc is not None:
                 raise exc from last_exc  # keep the provider error that led here
             raise
         waited_total += waited
+        attempted.add(ep.id)
         started = time.monotonic()
         try:
             result = call(ep)
@@ -305,15 +309,19 @@ async def run_with_failover_async(
     max_attempts = max(1, max_attempts)
     last_exc: Optional[BaseException] = None
     tried: list[str] = []
+    attempted: set[str] = set()
     waited_total = 0.0
     for _ in range(max_attempts):
         try:
-            ep, waited = await scheduler.acquire(max(0.0, scheduler.max_wait_seconds - waited_total))
+            ep, waited = await scheduler.acquire(
+                max(0.0, scheduler.max_wait_seconds - waited_total), attempted=attempted,
+            )
         except AllEndpointsExhausted as exc:
             if last_exc is not None:
                 raise exc from last_exc
             raise
         waited_total += waited
+        attempted.add(ep.id)
         started = time.monotonic()
         try:
             result = await call(ep)

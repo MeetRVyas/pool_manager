@@ -8,6 +8,8 @@ Selection (`strategy="priority"`, the default)
     at its (YAML) limit, cooling down or failing is skipped, which is what lets the
     pool switch to the next model *before* a rate limit is hit.
     `strategy="balanced"` ignores model order and just spreads load over everything.
+    Retries can supply attempted endpoint IDs: untried eligible endpoints then take
+    precedence, with the configured strategy ordering endpoints within each group.
 
 Waiting
     If nothing is available the scheduler sleeps exactly until the earliest endpoint
@@ -81,7 +83,7 @@ class LLMScheduler:
             return (ep.priority, ep.inflight, ep.use_seq)
         return (ep.inflight, ep.use_seq, ep.priority)
 
-    def _try_acquire(self, now: float) -> tuple[Optional[EndpointState], float]:
+    def _try_acquire(self, now: float, attempted: Optional[set[str]] = None) -> tuple[Optional[EndpointState], float]:
         """One non-blocking pass. Returns (endpoint, 0) or (None, seconds until one may free up)."""
         ready: list[EndpointState] = []
         soonest = math.inf
@@ -91,13 +93,14 @@ class LLMScheduler:
                 ready.append(ep)
             elif wait < soonest:
                 soonest = wait
-        for ep in sorted(ready, key=self._order_key):
+        attempted = attempted or set()
+        for ep in sorted(ready, key=lambda e: (e.id in attempted, self._order_key(e))):
             if ep.try_reserve(now):  # re-checks atomically; another thread may have won
                 return ep, 0.0
         return None, (0.0 if ready else soonest)
 
-    def _poll(self, now: float, deadline: float) -> tuple[Optional[EndpointState], float]:
-        ep, wait = self._try_acquire(now)
+    def _poll(self, now: float, deadline: float, attempted: Optional[set[str]] = None) -> tuple[Optional[EndpointState], float]:
+        ep, wait = self._try_acquire(now, attempted)
         if ep is not None:
             return ep, 0.0
         if wait == math.inf or now + wait > deadline + 1e-9:
@@ -125,23 +128,23 @@ class LLMScheduler:
         )
 
     # ------------------------------------------------------------------- acquire
-    async def acquire(self, max_wait: Optional[float] = None) -> tuple[EndpointState, float]:
-        """Reserve an endpoint. Returns (endpoint, seconds waited). Raises AllEndpointsExhausted."""
+    async def acquire(self, max_wait: Optional[float] = None, *, attempted: Optional[set[str]] = None) -> tuple[EndpointState, float]:
+        """Reserve an endpoint, preferring untried eligible IDs. Returns (endpoint, seconds waited)."""
         budget = self.max_wait_seconds if max_wait is None else max(0.0, max_wait)
         start = self.clock()
         deadline = start + budget
         while True:
-            ep, delay = self._poll(self.clock(), deadline)
+            ep, delay = self._poll(self.clock(), deadline, attempted)
             if ep is not None:
                 return ep, self.clock() - start
             await self._asleep(delay)
 
-    def acquire_sync(self, max_wait: Optional[float] = None) -> tuple[EndpointState, float]:
+    def acquire_sync(self, max_wait: Optional[float] = None, *, attempted: Optional[set[str]] = None) -> tuple[EndpointState, float]:
         budget = self.max_wait_seconds if max_wait is None else max(0.0, max_wait)
         start = self.clock()
         deadline = start + budget
         while True:
-            ep, delay = self._poll(self.clock(), deadline)
+            ep, delay = self._poll(self.clock(), deadline, attempted)
             if ep is not None:
                 return ep, self.clock() - start
             self._sleep(delay)

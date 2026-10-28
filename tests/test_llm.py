@@ -107,6 +107,34 @@ def test_programming_errors_are_not_swallowed():
 
 
 # ===================================================================== bounded effort
+@pytest.mark.parametrize("mode", ["sync", "async"])
+def test_slow_failures_try_unvisited_model_keys_before_revisiting_primary(mode):
+    ft = FakeTime(start=0)
+    failures = []
+
+    class SlowFailure(FakeClient):
+        def invoke(self, *args, **kwargs):
+            self.calls += 1
+            failures.append(self.name)
+            ft.t += 10  # earlier endpoints' cooldowns expire during this attempt
+            raise gemini_server_error(503, "UNAVAILABLE", "slow failure")
+
+        async def ainvoke(self, *args, **kwargs):
+            return self.invoke(*args, **kwargs)
+
+    eps = [
+        make_ep("google:flash:KEY_1", SlowFailure("flash-1"), priority=0),
+        make_ep("google:flash:KEY_2", SlowFailure("flash-2"), priority=0),
+        make_ep("google:lite:KEY_1", SlowFailure("lite-1"), priority=1),
+        make_ep("google:lite:KEY_2", FakeClient("healthy"), priority=1),
+    ]
+    llm = make_llm(eps, ft)
+    response = llm.invoke("hello") if mode == "sync" else run(llm.ainvoke("hello"))
+    assert response.content == "from healthy"
+    assert failures == ["flash-1", "flash-2", "lite-1"]
+    assert [ep.calls for ep in eps] == [1, 1, 1, 1]
+
+
 def test_attempts_are_capped_and_the_provider_error_is_chained():
     eps = [make_ep(f"google:flash:KEY_{i}", FakeClient(f"c{i}", [openai_500()])) for i in range(5)]
     llm = make_llm(eps, max_attempts=3)
@@ -115,6 +143,17 @@ def test_attempts_are_capped_and_the_provider_error_is_chained():
     assert sum(ep.client.calls for ep in eps) == 3              # stopped at 3, did not grind through all 5
     assert err.value.__cause__ is not None                      # last provider error is attached
     assert isinstance(err.value, AllEndpointsExhausted)         # old `except AllEndpointsExhausted` still works
+
+
+@pytest.mark.parametrize("mode", ["sync", "async"])
+def test_retry_can_reuse_an_endpoint_when_no_untried_endpoint_is_available(mode):
+    ft = FakeTime()
+    ep = make_ep("google:flash:KEY", FakeClient("recovered", [gemini_server_error(503, "UNAVAILABLE", "temporary")]))
+    llm = make_llm([ep], ft)
+    response = llm.invoke("hello") if mode == "sync" else run(llm.ainvoke("hello"))
+    assert response.content == "from recovered"
+    assert ep.calls == 2
+    assert ft.total_slept == pytest.approx(5)
 
 
 def test_sync_path_caps_attempts_too():
