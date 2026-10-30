@@ -62,6 +62,17 @@ def test_pool_serves_every_call_through_limits_an_outage_and_a_dead_key():
     ft = FakeTime()
     llm, providers, eps = build(ft)
     served, failures, per_call = collections.Counter(), [], []
+    original_sleep = llm.scheduler._asleep
+
+    async def checked_sleep(seconds):
+        # Sequential workload: the only waiter is the head. Its timer should
+        # target real eligibility, not wake every second for periodic polling.
+        soonest = min(ep.available_in(ft.now()) for ep in eps)
+        assert abs(seconds - max(0.001, soonest)) < 1e-6
+        assert 0 < seconds <= llm.scheduler.max_wait_seconds
+        await original_sleep(seconds)
+
+    llm.scheduler._asleep = checked_sleep
 
     async def workload():
         for i in range(400):
@@ -98,5 +109,6 @@ def test_pool_serves_every_call_through_limits_an_outage_and_a_dead_key():
 
     # Bounded waiting: no single call ever stalled longer than the wait budget (+ its own latency).
     assert max(per_call) <= 60 + 6 * LATENCY
-    # and the pool never slept in big blocks: waits are exact "until the earliest key frees up"
-    assert max(ft.sleeps) <= 1.0 + 1e-9
+    # Every requested sleep was checked against earliest eligibility above.
+    # Notifications can interrupt production waits before that timer expires.
+    assert ft.sleeps

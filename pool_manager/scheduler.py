@@ -13,7 +13,8 @@ Selection (`strategy="priority"`, the default)
 
 Waiting
     Sync and async callers share FIFO admission. Only the oldest live waiter may
-    reserve an endpoint; polling wake order cannot allow overtaking. Waiting still
+    reserve an endpoint. Queue advancement signals the next waiter immediately;
+    the head otherwise sleeps until known quota/cooldown reopening. Waiting still
     respects the per-acquisition budget, and impossible quota waits fail early.
     A retry joins at the back as a new acquisition, retaining endpoint history.
 """
@@ -25,7 +26,7 @@ import logging
 import math
 import time
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from contextlib import asynccontextmanager, contextmanager
 from typing import Awaitable, Callable, Optional
 
@@ -40,6 +41,9 @@ STRATEGIES = ("priority", "balanced")
 class _Waiter:
     deadline: float
     checked: bool = False
+    loop: Optional[asyncio.AbstractEventLoop] = None
+    signal: Optional[threading.Event] = field(default=None, repr=False)
+    ready: Optional[asyncio.Future] = field(default=None, repr=False)
 
 
 class AllEndpointsExhausted(Exception):
@@ -88,8 +92,8 @@ class LLMScheduler:
         self._admission_lock = threading.Lock()
         self._waiters: list[_Waiter] = []
 
-    def _join(self, deadline: float) -> _Waiter:
-        waiter = _Waiter(deadline)
+    def _join(self, deadline: float, loop=None) -> _Waiter:
+        waiter = _Waiter(deadline, loop=loop)
         with self._admission_lock:
             self._waiters.append(waiter)
         return waiter
@@ -97,12 +101,79 @@ class LLMScheduler:
     def _leave(self, waiter: _Waiter) -> None:
         with self._admission_lock:
             if waiter in self._waiters:
+                was_head = self._waiters[0] is waiter
                 self._waiters.remove(waiter)
+                if was_head:
+                    self._notify_head_locked()
+
+    @staticmethod
+    def _resolve(ready: asyncio.Future) -> None:
+        if not ready.done():
+            ready.set_result(None)
+
+    def _notify_head_locked(self) -> None:
+        if not self._waiters:
+            return
+        head = self._waiters[0]
+        if head.signal is not None:
+            head.signal.set()
+        # Capture this generation's future, not whatever the waiter creates later.
+        # Always deliver on its owning loop, including sync-to-async handoffs.
+        if head.loop is not None and head.ready is not None:
+            try:
+                head.loop.call_soon_threadsafe(self._resolve, head.ready)
+            except RuntimeError:
+                if not head.loop.is_closed():
+                    raise
+
+    def notify_changed(self) -> None:
+        """Recheck admission after endpoint state changes outside acquisition.
+
+        Pool outcome/release paths call this. Integrations changing quotas or
+        endpoint state directly should do so too; it never grants quota itself.
+        """
+        with self._admission_lock:
+            self._notify_head_locked()
+
+    def _arm_locked(self, waiter: _Waiter) -> None:
+        # Checking eligibility and arming share the notification lock: a change
+        # between the check and actual sleep cannot be lost. No objects are
+        # allocated on the uncontended successful admission path.
+        if waiter.loop is not None:
+            waiter.ready = waiter.loop.create_future()
+        else:
+            if waiter.signal is None:
+                waiter.signal = threading.Event()
+            waiter.signal.clear()
+
+    async def _wait_async(self, waiter: _Waiter, delay: float) -> None:
+        ready = waiter.ready
+        sleeper = asyncio.ensure_future(self._asleep(delay))
+        try:
+            done, _ = await asyncio.wait((ready, sleeper), return_when=asyncio.FIRST_COMPLETED)
+            if sleeper in done:
+                sleeper.result()  # Do not hide errors from injected clocks/sleep hooks.
+        finally:
+            if ready is not None:
+                ready.cancel()
+            sleeper.cancel()
+            await asyncio.gather(sleeper, return_exceptions=True)
+
+    def _wait_sync(self, waiter: _Waiter, delay: float) -> None:
+        if self._sleep is time.sleep:
+            waiter.signal.wait(delay)
+        else:
+            # Retain injectable virtual-clock sleeps. They cannot be interrupted
+            # like Event.wait, so keep the compatibility polling bound for them.
+            self._sleep(min(delay, self.poll_interval))
 
     def _admit(self, waiter: _Waiter, now: float, attempted):
         with self._admission_lock:
             # A delayed/cancelled task must not retain an expired queue position.
+            old_head = self._waiters[0] if self._waiters else None
             self._waiters[:] = [w for w in self._waiters if not w.checked or w.deadline + 1e-9 >= now]
+            if self._waiters and self._waiters[0] is not old_head:
+                self._notify_head_locked()
             if waiter not in self._waiters:
                 wait = min((ep.available_in(now) for ep in self.endpoints), default=math.inf)
                 raise self._exhausted(now, wait, waiter.deadline)
@@ -111,14 +182,18 @@ class LLMScheduler:
                 endpoint, delay = self._poll(now, waiter.deadline, attempted)
                 if endpoint is not None:
                     self._waiters.remove(waiter)
+                    self._notify_head_locked()
+                else:
+                    self._arm_locked(waiter)
                 return endpoint, delay
             wait = min((ep.available_in(now) for ep in self.endpoints), default=math.inf)
             remaining = waiter.deadline - now
             if remaining <= 0 or wait == math.inf or now + wait > waiter.deadline + 1e-9:
                 raise self._exhausted(now, wait, waiter.deadline)
-            # Polling only schedules another queue check; it can no longer award
-            # quota to a later arrival ahead of the queue's first live waiter.
-            return None, max(0.001, min(self.poll_interval, remaining, wait if wait > 0 else self.poll_interval))
+            # A follower needs no polling timer; head advancement signals it.
+            # Its own deadline still bounds the wait if the head never resumes.
+            self._arm_locked(waiter)
+            return None, remaining
 
     # ----------------------------------------------------------------- selection
     def _order_key(self, ep: EndpointState):
@@ -149,7 +224,7 @@ class LLMScheduler:
             return ep, 0.0
         if wait == math.inf or now + wait > deadline + 1e-9:
             raise self._exhausted(now, wait, deadline)
-        return None, max(0.001, min(wait, self.poll_interval))
+        return None, max(0.001, wait)
 
     def _exhausted(self, now: float, wait: float, deadline: float) -> AllEndpointsExhausted:
         if not self.endpoints:
@@ -177,13 +252,13 @@ class LLMScheduler:
         budget = self.max_wait_seconds if max_wait is None else max(0.0, max_wait)
         start = self.clock()
         deadline = start + budget
-        waiter = self._join(deadline)
+        waiter = self._join(deadline, asyncio.get_running_loop())
         try:
             while True:
                 ep, delay = self._admit(waiter, self.clock(), attempted)
                 if ep is not None:
                     return ep, self.clock() - start
-                await self._asleep(delay)
+                await self._wait_async(waiter, delay)
         finally:
             self._leave(waiter)
 
@@ -197,7 +272,7 @@ class LLMScheduler:
                 ep, delay = self._admit(waiter, self.clock(), attempted)
                 if ep is not None:
                     return ep, self.clock() - start
-                self._sleep(delay)
+                self._wait_sync(waiter, delay)
         finally:
             self._leave(waiter)
 
@@ -208,6 +283,7 @@ class LLMScheduler:
             yield endpoint
         finally:
             endpoint.release()
+            self.notify_changed()
 
     @contextmanager
     def allocate_endpoint_sync(self, max_wait: Optional[float] = None):
@@ -216,6 +292,7 @@ class LLMScheduler:
             yield endpoint
         finally:
             endpoint.release()
+            self.notify_changed()
 
     # ------------------------------------------------------------- observability
     def stats(self) -> list[dict]:

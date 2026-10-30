@@ -70,8 +70,9 @@ def test_sync_and_async_callers_share_one_admission_order():
         sync_waiting.set()
         assert release_sync.wait(5)
     async def async_sleep(delay):
-        # A later async waiter cannot take the slot while sync head is sleeping.
-        assert served == []
+        # A head-advance signal can interrupt this sleep before the fake clock
+        # advances; tolerate another call after the sync head has been served.
+        assert served in ([], ["sync"])
         release_sync.set()
         await asyncio.to_thread(thread.join, 5)
         ft.t = 120

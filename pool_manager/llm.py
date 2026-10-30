@@ -314,6 +314,7 @@ def _run_with_failover_sync(
             return result
         finally:
             ep.release()
+            scheduler.notify_changed()
     raise _failed(tried, max_attempts) from last_exc
 
 
@@ -375,6 +376,7 @@ async def _run_with_failover_async(
             return result
         finally:
             ep.release()
+            scheduler.notify_changed()
     raise _failed(tried, max_attempts) from last_exc
 
 
