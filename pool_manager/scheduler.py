@@ -12,10 +12,10 @@ Selection (`strategy="priority"`, the default)
     precedence, with the configured strategy ordering endpoints within each group.
 
 Waiting
-    If nothing is available the scheduler sleeps exactly until the earliest endpoint
-    frees up -- but only if that fits in the wait budget. If the earliest availability
-    is later than the budget (e.g. every key is out of daily quota) it raises
-    immediately instead of sleeping out the budget for nothing.
+    Sync and async callers share FIFO admission. Only the oldest live waiter may
+    reserve an endpoint; polling wake order cannot allow overtaking. Waiting still
+    respects the per-acquisition budget, and impossible quota waits fail early.
+    A retry joins at the back as a new acquisition, retaining endpoint history.
 """
 
 from __future__ import annotations
@@ -24,6 +24,8 @@ import asyncio
 import logging
 import math
 import time
+import threading
+from dataclasses import dataclass
 from contextlib import asynccontextmanager, contextmanager
 from typing import Awaitable, Callable, Optional
 
@@ -32,6 +34,12 @@ from pool_manager.endpoint_state import EndpointState
 logger = logging.getLogger("pool_manager.scheduler")
 
 STRATEGIES = ("priority", "balanced")
+
+
+@dataclass(eq=False)
+class _Waiter:
+    deadline: float
+    checked: bool = False
 
 
 class AllEndpointsExhausted(Exception):
@@ -75,6 +83,42 @@ class LLMScheduler:
         self.clock = clock
         self._sleep = sleep
         self._asleep = asleep
+        # One queue for sync threads and async tasks. Never hold this lock across
+        # provider calls, sleeps or awaits. Endpoint preference is unchanged.
+        self._admission_lock = threading.Lock()
+        self._waiters: list[_Waiter] = []
+
+    def _join(self, deadline: float) -> _Waiter:
+        waiter = _Waiter(deadline)
+        with self._admission_lock:
+            self._waiters.append(waiter)
+        return waiter
+
+    def _leave(self, waiter: _Waiter) -> None:
+        with self._admission_lock:
+            if waiter in self._waiters:
+                self._waiters.remove(waiter)
+
+    def _admit(self, waiter: _Waiter, now: float, attempted):
+        with self._admission_lock:
+            # A delayed/cancelled task must not retain an expired queue position.
+            self._waiters[:] = [w for w in self._waiters if not w.checked or w.deadline + 1e-9 >= now]
+            if waiter not in self._waiters:
+                wait = min((ep.available_in(now) for ep in self.endpoints), default=math.inf)
+                raise self._exhausted(now, wait, waiter.deadline)
+            waiter.checked = True
+            if self._waiters[0] is waiter:
+                endpoint, delay = self._poll(now, waiter.deadline, attempted)
+                if endpoint is not None:
+                    self._waiters.remove(waiter)
+                return endpoint, delay
+            wait = min((ep.available_in(now) for ep in self.endpoints), default=math.inf)
+            remaining = waiter.deadline - now
+            if remaining <= 0 or wait == math.inf or now + wait > waiter.deadline + 1e-9:
+                raise self._exhausted(now, wait, waiter.deadline)
+            # Polling only schedules another queue check; it can no longer award
+            # quota to a later arrival ahead of the queue's first live waiter.
+            return None, max(0.001, min(self.poll_interval, remaining, wait if wait > 0 else self.poll_interval))
 
     # ----------------------------------------------------------------- selection
     def _order_key(self, ep: EndpointState):
@@ -133,21 +177,29 @@ class LLMScheduler:
         budget = self.max_wait_seconds if max_wait is None else max(0.0, max_wait)
         start = self.clock()
         deadline = start + budget
-        while True:
-            ep, delay = self._poll(self.clock(), deadline, attempted)
-            if ep is not None:
-                return ep, self.clock() - start
-            await self._asleep(delay)
+        waiter = self._join(deadline)
+        try:
+            while True:
+                ep, delay = self._admit(waiter, self.clock(), attempted)
+                if ep is not None:
+                    return ep, self.clock() - start
+                await self._asleep(delay)
+        finally:
+            self._leave(waiter)
 
     def acquire_sync(self, max_wait: Optional[float] = None, *, attempted: Optional[set[str]] = None) -> tuple[EndpointState, float]:
         budget = self.max_wait_seconds if max_wait is None else max(0.0, max_wait)
         start = self.clock()
         deadline = start + budget
-        while True:
-            ep, delay = self._poll(self.clock(), deadline, attempted)
-            if ep is not None:
-                return ep, self.clock() - start
-            self._sleep(delay)
+        waiter = self._join(deadline)
+        try:
+            while True:
+                ep, delay = self._admit(waiter, self.clock(), attempted)
+                if ep is not None:
+                    return ep, self.clock() - start
+                self._sleep(delay)
+        finally:
+            self._leave(waiter)
 
     @asynccontextmanager
     async def allocate_endpoint(self, max_wait: Optional[float] = None):
