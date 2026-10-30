@@ -9,3 +9,13 @@ pool_eval_*/
 *.pyc
 output/
 files.zip
+
+# Local research archive
+/docs/*
+!/docs/caller_deadlines.md
+!/docs/benchmarks.md
+!/docs/final_metrics.md
+/evals/results/
+/scripts/build_claude_handoff.py
+/configs/local.yaml
+*.bundle

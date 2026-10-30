@@ -13,7 +13,7 @@ $ErrorActionPreference = 'Stop'
 $taskRoot = Split-Path -Parent $PSScriptRoot
 $taskPython = Join-Path $taskRoot '.venv\Scripts\python.exe'
 if (-not (Test-Path -LiteralPath $taskPython)) {
-    throw "Project Python missing. Create .venv and install requirements.txt first; see docs\live_eval_runbook.md."
+    throw "Project Python missing. Create .venv and install requirements.txt first; see evals\README.md."
 }
 $env:PYTHONUTF8 = '1'
 $env:PYTHONIOENCODING = 'utf-8'

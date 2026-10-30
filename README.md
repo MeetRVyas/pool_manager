@@ -106,7 +106,7 @@ The [model-limits catalogue](configs/model_limits.yaml) supplies local RPM, TPM,
 | Wake-up comparison: two 1,000-caller Gemini runs at 48/min | Observed eligible-capacity idle with queued callers **68.9s → 6.6s**, a **90.4% reduction** |
 | Separate Gemini soak at 30 requests/minute | **1,000/1,000 responses**, exactly **1,000 attempts**, no provider errors or retries |
 
-These measure different workloads. The FIFO simulation traded a higher median wait for fairness and a lower p99. In the paired live wake-up comparison, admission p95 improved **2.3%**, while provider errors increased **8 → 20** with retries disabled. The separate 30/minute soak predates the wake-up fix. Full methodology, failures, and limitations are retained in the [metrics](docs/final_metrics.md) and [wake-up comparison](docs/post_checkpoint_wakeup_results.md).
+These measure different workloads. The FIFO simulation traded a higher median wait for fairness and a lower p99. In the paired live wake-up comparison, admission p95 improved **2.3%**, while provider errors increased **8 → 20** with retries disabled. The separate 30/minute soak predates the wake-up fix. Full methodology, failures, and limitations are retained in the [benchmark notes](docs/benchmarks.md).
 
 ## Scope
 
@@ -122,11 +122,10 @@ The latest full offline verification passed **360 tests**. Run the suite without
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-For load tests, result recording, and explicit live-run commands, see the [evaluation guide](evals/README.md) and [PowerShell runbook](docs/live_eval_runbook.md).
+For load tests, result recording, and explicit live-run commands, see the [evaluation guide](evals/README.md) for CLI commands and PowerShell usage.
 
 ## Documentation
 
-- [Engineering case study](docs/project_case_study.md) — problems encountered, diagnosis, fixes, and tradeoffs.
-- [Project context and metrics](docs/final_metrics.md) — results and their supporting evidence.
-- [FIFO wake-up comparison](docs/post_checkpoint_wakeup_results.md) — the latest queue-focused investigation.
-- [Evaluation guide](evals/README.md) — reproducible simulations and live workloads.
+- [Benchmark notes](docs/benchmarks.md) — workloads, selected results, and tradeoffs.
+- [Evaluation guide](evals/README.md) — offline checks and explicit live-run commands.
+- [Caller deadlines](docs/caller_deadlines.md) — timeout behavior and cancellation limits.
