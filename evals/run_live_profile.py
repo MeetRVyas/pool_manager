@@ -24,6 +24,7 @@ import yaml
 
 from evals.live_eval import Plan, arrivals, summarize_live, _fmt
 from evals.metrics import percentile
+from evals.loop_diagnostics import CALL as DIAGNOSTIC_CALL, LoopDiagnostics, backend_metadata, timing_summary
 from evals.sim import _drive, outcome_of
 from pool_manager.errors import classify
 from pool_manager.limits import LimitsCatalogue
@@ -31,6 +32,12 @@ from pool_manager.llm import get_llm
 
 ROOT = Path(__file__).resolve().parents[1]
 PROFILES = {
+    "diagnostic-paced-100": dict(calls=100, request_timeout=30, caller_timeout=90, max_attempts=2,
+                                  pattern="paced", config="lites.yaml", rate_per_min=30),
+    "diagnostic-burst-100": dict(calls=100, request_timeout=30, caller_timeout=90, max_attempts=2,
+                                  pattern="burst", config="lites.yaml", rate_per_min=30),
+    "diagnostic-12-12rpm": dict(calls=12, request_timeout=30, caller_timeout=90, max_attempts=2,
+                                pattern="paced", config="lites.yaml", rate_per_min=12),
     "lites-1900-48rpm": dict(calls=1900, request_timeout=60, pattern="paced", config="lites.yaml",
                                 rate_per_min=48),
     "lites-1400-36rpm": dict(calls=1400, request_timeout=60, pattern="paced", config="lites.yaml",
@@ -63,10 +70,14 @@ def source_metadata():
                                            text=True, encoding="utf-8").strip()
         except (OSError, subprocess.CalledProcessError):
             return None
-    paths = sorted((ROOT / "pool_manager").glob("*.py")) + [Path(__file__), ROOT / "evals/live_eval.py", ROOT / "evals/sim.py"]
+    paths = sorted((ROOT / "pool_manager").glob("*.py")) + [
+        Path(__file__), ROOT / "evals/live_eval.py", ROOT / "evals/sim.py",
+        ROOT / "evals/loop_diagnostics.py", ROOT / "evals/metrics.py",
+    ]
     hashes = {p.relative_to(ROOT).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}
     versions = {}
-    for name in ("langchain-core", "langchain-google-genai", "google-genai", "langchain-openai", "python-dotenv", "pyyaml"):
+    for name in ("langchain-core", "langchain-google-genai", "google-genai", "langchain-openai",
+                 "python-dotenv", "pyyaml", "httpx", "httpcore", "httpx2", "truststore"):
         try:
             versions[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
@@ -108,6 +119,7 @@ def prepare(profile, env_file):
                 endpoints.append(dict(id=f"{provider}:{model}:{name}", rpm=lim.rpm, tpm=lim.tpm,
                                       rpd=lim.rpd, daily_reset=lim.daily_reset))
     plan = Plan(calls=selected["calls"], request_timeout=selected["request_timeout"],
+                caller_timeout=selected.get("caller_timeout"), max_attempts=selected.get("max_attempts", 6),
                 rate_per_min=selected.get("rate_per_min", 30), pattern=selected["pattern"], seed=1, max_wait=70,
                 limits_path="limits.snapshot.yaml")
     offsets = arrivals(plan)
@@ -155,13 +167,15 @@ def configure_logging(folder, secrets):
 
 
 class ObservedClient:
-    def __init__(self, endpoint):
+    def __init__(self, endpoint, origin=0.0):
         self.client, self.endpoint_id = endpoint.client, endpoint.id
+        self.origin = origin
 
     async def ainvoke(self, *args, **kwargs):
         row = CURRENT.get()
         start = time.perf_counter()
-        attempt = {"endpoint": self.endpoint_id}
+        attempt = {"endpoint": self.endpoint_id, "start_offset_s": time.monotonic() - self.origin,
+                   "overlaps_loop_stall": None}
         try:
             reply = await self.client.ainvoke(*args, **kwargs)
             attempt.update(ok=True, usage=getattr(reply, "usage_metadata", None))
@@ -176,6 +190,7 @@ class ObservedClient:
             raise
         finally:
             attempt["duration_s"] = time.perf_counter() - start
+            attempt["end_offset_s"] = time.monotonic() - self.origin
             if row is not None:
                 row["attempts"].append(attempt)
 
@@ -195,7 +210,7 @@ def windows(rows, size=100):
     return groups
 
 
-async def execute(manifest, folder, secrets, progress_every):
+async def execute(manifest, folder, secrets, progress_every, *, diagnostics=False, stack_dumps=False):
     write_json(folder / "manifest.json", manifest, secrets)
     for name, data in (("config.snapshot.yaml", manifest["config"]), ("limits.snapshot.yaml", manifest["model_limits"])):
         (folder / name).write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
@@ -205,6 +220,7 @@ async def execute(manifest, folder, secrets, progress_every):
     started = time.perf_counter()
     last_checkpoint = started
     pool = None
+    diag = None
 
     def save(state):
         checkpoint.update(state=state, updated_at_utc=utc_now(), wall_seconds=time.perf_counter() - started,
@@ -216,9 +232,26 @@ async def execute(manifest, folder, secrets, progress_every):
     save("starting")
     try:
         pool = get_llm(folder / "config.snapshot.yaml", limits_path=folder / "limits.snapshot.yaml",
-                       max_wait_seconds=plan.max_wait, request_timeout=plan.request_timeout)
+                       max_wait_seconds=plan.max_wait, request_timeout=plan.request_timeout,
+                       caller_timeout=plan.caller_timeout, max_attempts=plan.max_attempts)
+        loop = asyncio.get_running_loop()
+        origin = loop.time()
+        if diagnostics:
+            diag = LoopDiagnostics(folder, origin=origin, secrets=secrets, stack_dumps=stack_dumps)
+            await diag.start()
+        backends = {}
         for ep in pool.scheduler.endpoints:
-            ep.client = ObservedClient(ep)
+            backend, metadata = backend_metadata(ep.client)
+            metadata["trace_attached"] = bool(diag is not None and backend is not None
+                                               and hasattr(backend, "event_hooks"))
+            backends[ep.id] = metadata
+            if metadata["trace_attached"]:
+                diag.attach_httpx(backend, ep.id)
+            ep.client = ObservedClient(ep, origin)
+        manifest.update(http_backends=backends, loop_type=type(loop).__name__,
+                        diagnostics_enabled=diagnostics, diagnostic_stack_dumps=stack_dumps)
+        checkpoint.update(manifest)
+        write_json(folder / "manifest.json", manifest, secrets)
         acquire = pool.scheduler.acquire
 
         async def observed_acquire(*args, **kwargs):
@@ -231,8 +264,6 @@ async def execute(manifest, folder, secrets, progress_every):
                     row["scheduler_s"] += time.perf_counter() - before
 
         pool.scheduler.acquire = observed_acquire
-        loop = asyncio.get_running_loop()
-        origin = loop.time()
         offsets = arrivals(plan)
 
         async def call(i):
@@ -240,6 +271,7 @@ async def execute(manifest, folder, secrets, progress_every):
             row = dict(id=i, arrival_offset_s=offsets[i], actual_start_offset_s=loop.time() - origin,
                        scheduler_s=0.0, attempts=[], outcome="ok")
             token = CURRENT.set(row)
+            diagnostic_token = DIAGNOSTIC_CALL.set(i)
             before = time.perf_counter()
             active += 1
             peak = max(peak, active)
@@ -250,10 +282,17 @@ async def execute(manifest, folder, secrets, progress_every):
                 raise
             finally:
                 row.update(latency_s=time.perf_counter() - before, end_offset_s=loop.time() - origin)
+                row["dispatch_lateness_s"] = max(0.0, row["actual_start_offset_s"] - row["arrival_offset_s"])
+                row["scheduled_to_result_s"] = row["end_offset_s"] - row["arrival_offset_s"]
+                row["overlaps_loop_stall"] = None if diag is None else diag.overlaps(
+                    row["arrival_offset_s"], row["end_offset_s"])
+                row["dispatch_overlaps_loop_stall"] = None if diag is None else diag.overlaps(
+                    row["arrival_offset_s"], row["actual_start_offset_s"])
                 row["provider_s"] = sum(a["duration_s"] for a in row["attempts"])
                 row["other_s"] = max(0, row["latency_s"] - row["scheduler_s"] - row["provider_s"])
                 active -= 1
                 CURRENT.reset(token)
+                DIAGNOSTIC_CALL.reset(diagnostic_token)
                 completed.append(row)
                 # Append each completed caller, without rewriting a growing full JSON
                 # file on every completion and adding avoidable event-loop stalls.
@@ -272,13 +311,26 @@ async def execute(manifest, folder, secrets, progress_every):
         logging.info("Starting pool-only profile %s: %s calls, %s, timeout=%ss, rate=%s/min", manifest["profile"],
                      plan.calls, plan.pattern, plan.request_timeout, plan.rate_per_min)
         results = await _drive(call, [origin + offset for offset in offsets])
+        if diag is not None:
+            await diag.aclose()
+            # An overlapping heartbeat may be recorded after a call's journal row.
+            # The final result reclassifies all calls and individual attempts.
+            for row in completed:
+                row["overlaps_loop_stall"] = diag.overlaps(row["arrival_offset_s"], row["end_offset_s"])
+                row["dispatch_overlaps_loop_stall"] = diag.overlaps(row["arrival_offset_s"], row["actual_start_offset_s"])
+                for attempt in row["attempts"]:
+                    attempt["overlaps_loop_stall"] = diag.overlaps(attempt["start_offset_s"], attempt["end_offset_s"])
         summary = summarize_live(results, pool.stats())
         summary.update(target="pool", max_concurrent_calls=peak, calls=sorted(completed, key=lambda r: r["id"]))
+        summary["timing_boundaries"] = timing_summary(completed)
+        summary["primary_latency_boundary"] = "scheduled_arrival_to_result"
         checkpoint["results"] = {"pool": summary}
         save("complete")
         write_json(folder / "results.json", checkpoint, secrets)
         report = ["# Live evaluation result", "", f"Profile: {manifest['profile']}", "",
                   f"Success: {sum(r['outcome'] == 'ok' for r in completed)}/{plan.calls}", "",
+                  "Timing boundaries (seconds):", "", "```json",
+                  json.dumps(summary["timing_boundaries"], indent=2), "```", "",
                   "Successful-call percentiles; timings below are cumulative caller time, not elapsed wall time.", "",
                   "| Calls | Success | p50 | p95 | Attempts | Scheduler seconds | Provider seconds |",
                   "|---|---:|---:|---:|---:|---:|---:|"]
@@ -287,11 +339,16 @@ async def execute(manifest, folder, secrets, progress_every):
             report.append(f"| {w['first_call']}-{w['last_call']} | {w['successes']}/{w['completed']} | {fmt(w['p50'])} | {fmt(w['p95'])} | {w['provider_attempts']} | {w['scheduler_s']:.3f} | {w['provider_s']:.3f} |")
         (folder / "summary.md").write_text("\n".join(report) + "\n", encoding="utf-8")
         logging.info("\n%s", _fmt(summary))
+        logging.info("Primary scheduled-arrival latency (successful callers): %s",
+                     summary["timing_boundaries"]["scheduled_arrival_success"])
         logging.info("Completed; artifacts: %s", folder)
         return 0 if summary["success_rate"] == 1 else 1
     except BaseException:
         save("interrupted_or_failed")
         raise
+    finally:
+        if diag is not None:
+            await diag.aclose()
 
 
 def main(argv=None):
@@ -300,10 +357,15 @@ def main(argv=None):
     parser.add_argument("--env-file", type=Path, default=ROOT / ".env")
     parser.add_argument("--label", default="fresh")
     parser.add_argument("--output-root", type=Path, default=ROOT / "evals/results/runs")
+    parser.add_argument("--diagnostics", action="store_true", help="opt in to loop/debug/HTTP tracing")
+    parser.add_argument("--diagnostic-stack-dumps", action="store_true",
+                        help="also take ownership of process-global C traceback scheduling")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--yes", action="store_true", help="make live calls; without this flag only offline preparation runs")
     mode.add_argument("--prepare", action="store_true", help="offline validation only; no client construction or API calls")
     args = parser.parse_args(argv)
+    if args.diagnostic_stack_dumps and not args.diagnostics:
+        parser.error("--diagnostic-stack-dumps requires --diagnostics")
     try:
         manifest, secrets = prepare(args.profile, args.env_file)
     except (ValueError, OSError, yaml.YAMLError) as exc:
@@ -325,7 +387,8 @@ def main(argv=None):
     manifest.update(run_id=run_id, label=label, fresh_quota_confirmed_by_provider=False,
                     automatic_resume=False)
     try:
-        return asyncio.run(execute(manifest, folder, secrets, 100 if manifest["plan"]["calls"] >= 1000 else 10))
+        return asyncio.run(execute(manifest, folder, secrets, 100 if manifest["plan"]["calls"] >= 1000 else 10,
+                                   diagnostics=args.diagnostics, stack_dumps=args.diagnostic_stack_dumps))
     except KeyboardInterrupt:
         logging.warning("Interrupted. Partial results preserved in %s. No automatic resume or replay.", folder)
         return 130

@@ -112,6 +112,30 @@ def test_explicit_live_mode_writes_complete_traces_with_fake_clients(env_file, t
         assert result["source"]["git_commit"] == "test"
 
 
+def test_opt_in_diagnostics_and_timing_boundaries_with_fake_provider(env_file, tmp_path, monkeypatch):
+    monkeypatch.setitem(runner.PROFILES, "diagnostic-tiny",
+                        dict(calls=2, request_timeout=30, pattern="burst", config="lites.yaml"))
+    monkeypatch.setattr(runner, "get_llm", lambda *a, **k: make_llm([
+        make_ep("google:gemini-3.5-flash-lite:GEMINI_API_KEY", FakeClient("offline"))]))
+    monkeypatch.setattr(runner, "configure_logging", lambda *a: None)
+    out = tmp_path / "diagnostic-runs"
+    assert runner.main(["--profile", "diagnostic-tiny", "--env-file", str(env_file),
+                        "--output-root", str(out), "--yes", "--diagnostics"]) == 0
+    folder = next(out.iterdir())
+    result = json.loads((folder / "results.json").read_text())
+    manifest = json.loads((folder / "manifest.json").read_text())
+    assert manifest["diagnostics_enabled"] is True
+    assert manifest["http_backends"]
+    summary = result["results"]["pool"]
+    assert summary["primary_latency_boundary"] == "scheduled_arrival_to_result"
+    assert summary["timing_boundaries"]["loop_stall_measurement_enabled"] is True
+    for row in summary["calls"]:
+        assert row["scheduled_to_result_s"] >= row["dispatch_lateness_s"]
+        assert isinstance(row["overlaps_loop_stall"], bool)
+        assert isinstance(row["attempts"][0]["overlaps_loop_stall"], bool)
+    assert (folder / "diagnostics.summary.json").exists()
+
+
 def test_failed_provider_initialization_leaves_checkpoint(env_file, tmp_path, monkeypatch):
     def fail(*a, **kw):
         raise RuntimeError("do not log credentials")
