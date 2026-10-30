@@ -28,6 +28,12 @@ llm.with_structured_output(MySchema).ainvoke(...) ; llm.bind_tools([...]).ainvok
 print(llm.usage_report())                          # which model/key got how much traffic
 ```
 
+The uncommitted follow-up adds FIFO admission and an optional `caller_timeout`
+covering pool waiting and provider retries. It defaults to disabled. See
+[deadline semantics](docs/caller_deadlines.md) for async cancellation and the sync
+worker limitation, and [working-change notes](docs/fifo_and_diagnostics_working_changes.md)
+for the code snapshot to which the historical metrics apply.
+
 ## Config
 
 `configs/llm_config.yaml` — **order of `models` is the preference order** (see `llm_config.example.yaml`).
@@ -118,6 +124,10 @@ and a per-request `timeout` is set, so the pool sees failures immediately and a 
 * Daily `midnight_pt` needs tz data (`pip install tzdata` on Windows), otherwise falls back to fixed UTC-8.
 
 ## Evaluation
+
+Start with [project context and current metrics](docs/final_metrics.md) and the [engineering case study](docs/project_case_study.md) when handing this repository to an unfamiliar LLM. For an LLM that already knows the tests preceding Claude's latency review, use the [Claude-onward handoff](docs/post_claude_handoff.md).
+
+The [latest 30 October soak](evals/results/LIVE_2026-10-30_SOAK_COMPARISON.md) completed **1,000/1,000 at 30 requests/minute**, with scheduled-arrival p50/p95/p99 **0.931s/2.980s/6.787s** and no retries or errors. The same code earlier completed 965/1,000 after provider quota loss. These are different quota/service observations, not a causal speed comparison. Current uncommitted FIFO admission retains a documented burst wake-up limitation; caller deadlines are optional and were disabled in these soaks.
 
 The [final 1,900-call run at 48/minute](evals/results/LIVE_2026-10-28_PACED_1900_48RPM.md) completed **1,807/1,900 (95.1%)**, with p50 17.218s, p95 64.868s, p99 101.317s and zero provider 429s. All 93 failures were local exhaustion outcomes; no daily cap was reached. Equal offered and configured RPM leaves no retry/cooldown capacity. This operating-boundary result complements the spare-capacity soak below.
 
