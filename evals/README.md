@@ -238,3 +238,15 @@ latency is variable too. This small sample is not a paired pool-speed benchmark.
 `vtime.py` virtual clock - `provider.py` rate-limited fake provider - `scenarios.py` workloads and capacity bound - `impls.py` the
 implementations - `sim.py` one run - `metrics.py` metrics and statistics - `run_eval.py` runner - `report.py` report writer -
 `live_eval.py` real-API harness - `baselines/pm_v3/` the previous pool, verbatim - `results/` the committed 30-seed run.
+
+## Queue-focused recording
+
+`python -m evals.admission_probe` prepares an offline plan. Live calls require an explicit `--yes`; larger runs also require `--allow-large`. The recorder writes timestamped events through a bounded background-writer queue, and calculates metrics only after recording closes.
+
+Use `python -m evals.admission_probe --analyze RUN_FOLDER` for a single recording. For a matched comparison:
+
+```powershell
+python -m evals.analyze_admission_comparison --baseline BASELINE_FOLDER --fixed FIXED_FOLDER --out comparison.json
+```
+
+The analyzer checks workload, limits, dependencies, recorder identity, and recording completeness before accepting a comparison. See the [completed paired 1,000-call investigation](../docs/post_checkpoint_wakeup_results.md) for results and interpretation.
