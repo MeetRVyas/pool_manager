@@ -65,6 +65,7 @@ LIVE_KEYS = (  # the subset of metrics.summarize that is meaningful without prov
     "n_calls", "success_rate", "exhausted_rate", "attempts_failed_429_rate", "leaked_429_rate",
     "ratelimit_failure_rate", "attempts_failed_other_rate", "leaked_5xx_rate", "other_fail_rate",
     "lat_p50", "lat_p95", "lat_p99", "lat_max", "fail_latency_mean", "slow_call_rate",
+    "deadline_exceeded_rate",
 )
 
 
@@ -77,6 +78,8 @@ class Plan:
     prompt: str = "Reply with exactly one word: ok"
     max_wait: float = 60.0            # the pool's max_wait_seconds
     request_timeout: float = 60.0
+    caller_timeout: Optional[float] = None
+    max_attempts: int = 6
     limits_path: Optional[str] = "auto"
 
 
@@ -126,7 +129,9 @@ def build_target(mode: str, config: str | Path, plan: Plan, *, clock: Optional[C
 
     if mode in ("pool", "pool-reactive"):
         limits = plan.limits_path if mode == "pool" else None
-        pool = pm.get_llm(config, max_wait_seconds=plan.max_wait, limits_path=limits, request_timeout=plan.request_timeout)
+        pool = pm.get_llm(config, max_wait_seconds=plan.max_wait, limits_path=limits,
+                          request_timeout=plan.request_timeout, caller_timeout=plan.caller_timeout,
+                          max_attempts=plan.max_attempts)
         if clock is not None:
             pool.scheduler.clock = clock
 

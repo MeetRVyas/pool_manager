@@ -14,9 +14,10 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.runnables import Runnable, RunnableConfig
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from pool_manager.benchmark import CallRecord, get_tracker
+from pool_manager.deadline import CallerDeadlineExceeded, run_async, run_sync, validate_timeout
 from pool_manager.endpoint_state import CooldownPolicy, EndpointState
 from pool_manager.errors import Classified, Kind, classify
 from pool_manager.limits import LimitsCatalogue, resolve_limits
@@ -29,6 +30,7 @@ from pool_manager.scheduler import (
 __all__ = [
     "AllAttemptsFailed",
     "AllEndpointsExhausted",
+    "CallerDeadlineExceeded",
     "MultiProviderChatLLM",
     "build_endpoints",
     "describe_endpoints",
@@ -250,13 +252,19 @@ def _failed(tried: list[str], max_attempts: int) -> AllAttemptsFailed:
     return AllAttemptsFailed(f"All {max_attempts} attempts failed -> " + "; ".join(tried))
 
 
-def run_with_failover_sync(
+def run_with_failover_sync(scheduler, call, *, max_attempts, phase, usage_of, caller_timeout=None):
+    return run_sync(lambda deadline: _run_with_failover_sync(
+        scheduler, call, max_attempts=max_attempts, phase=phase, usage_of=usage_of, deadline=deadline), caller_timeout)
+
+
+def _run_with_failover_sync(
     scheduler: LLMScheduler,
     call: Callable[[EndpointState], T],
     *,
     max_attempts: int,
     phase: str,
     usage_of: Callable[[Any], dict],
+    deadline=None,
 ) -> T:
     """
     Run `call(endpoint)`; on a retryable failure (429, quota, 5xx, timeout, dead key) mark
@@ -269,11 +277,17 @@ def run_with_failover_sync(
     attempted: set[str] = set()
     waited_total = 0.0
     for _ in range(max_attempts):
+        remaining = max(0.0, scheduler.max_wait_seconds - waited_total)
+        if deadline is not None:
+            deadline.check()
+            remaining = min(remaining, deadline.remaining())
         try:
             ep, waited = scheduler.acquire_sync(
-                max(0.0, scheduler.max_wait_seconds - waited_total), attempted=attempted,
+                remaining, attempted=attempted,
             )
         except AllEndpointsExhausted as exc:
+            if deadline is not None:
+                deadline.check()
             if last_exc is not None:
                 raise exc from last_exc  # keep the provider error that led here
             raise
@@ -281,7 +295,13 @@ def run_with_failover_sync(
         attempted.add(ep.id)
         started = time.monotonic()
         try:
+            if deadline is not None:
+                deadline.check()
             result = call(ep)
+            if deadline is not None:
+                deadline.check()
+        except CallerDeadlineExceeded:
+            raise
         except Exception as exc:
             info = classify(exc)
             if not info.failover:
@@ -297,13 +317,19 @@ def run_with_failover_sync(
     raise _failed(tried, max_attempts) from last_exc
 
 
-async def run_with_failover_async(
+async def run_with_failover_async(scheduler, call, *, max_attempts, phase, usage_of, caller_timeout=None):
+    return await run_async(lambda deadline: _run_with_failover_async(
+        scheduler, call, max_attempts=max_attempts, phase=phase, usage_of=usage_of, deadline=deadline), caller_timeout)
+
+
+async def _run_with_failover_async(
     scheduler: LLMScheduler,
     call: Callable[[EndpointState], Awaitable[T]],
     *,
     max_attempts: int,
     phase: str,
     usage_of: Callable[[Any], dict],
+    deadline=None,
 ) -> T:
     """Async twin of run_with_failover_sync."""
     max_attempts = max(1, max_attempts)
@@ -312,11 +338,17 @@ async def run_with_failover_async(
     attempted: set[str] = set()
     waited_total = 0.0
     for _ in range(max_attempts):
+        remaining = max(0.0, scheduler.max_wait_seconds - waited_total)
+        if deadline is not None:
+            deadline.check()
+            remaining = min(remaining, deadline.remaining())
         try:
             ep, waited = await scheduler.acquire(
-                max(0.0, scheduler.max_wait_seconds - waited_total), attempted=attempted,
+                remaining, attempted=attempted,
             )
         except AllEndpointsExhausted as exc:
+            if deadline is not None:
+                deadline.check()
             if last_exc is not None:
                 raise exc from last_exc
             raise
@@ -324,7 +356,13 @@ async def run_with_failover_async(
         attempted.add(ep.id)
         started = time.monotonic()
         try:
+            if deadline is not None:
+                deadline.check()
             result = await call(ep)
+            if deadline is not None:
+                deadline.check()
+        except CallerDeadlineExceeded:
+            raise
         except Exception as exc:
             info = classify(exc)
             if not info.failover:
@@ -365,12 +403,14 @@ class _MultiProviderToolBoundRunnable(Runnable[LanguageModelInput, BaseMessage])
         tool_choice: Any = None,
         bind_kwargs: Optional[Dict[str, Any]] = None,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+        caller_timeout: Optional[float] = None,
     ) -> None:
         self.scheduler = scheduler
         self.tools = tools
         self.tool_choice = tool_choice
         self.bind_kwargs = bind_kwargs or {}
         self.max_attempts = max_attempts
+        self.caller_timeout = validate_timeout(caller_timeout)
 
     def _bind_endpoint(self, ep: EndpointState):
         kwargs = dict(self.bind_kwargs)
@@ -385,6 +425,7 @@ class _MultiProviderToolBoundRunnable(Runnable[LanguageModelInput, BaseMessage])
             max_attempts=self.max_attempts,
             phase=_phase_from_config(config),
             usage_of=_usage_of_message,
+            caller_timeout=self.caller_timeout,
         )
 
     async def ainvoke(
@@ -399,6 +440,7 @@ class _MultiProviderToolBoundRunnable(Runnable[LanguageModelInput, BaseMessage])
             max_attempts=self.max_attempts,
             phase=_phase_from_config(config),
             usage_of=_usage_of_message,
+            caller_timeout=self.caller_timeout,
         )
 
 
@@ -427,12 +469,14 @@ class _MultiProviderStructuredRunnable(Runnable[LanguageModelInput, Union[Dict, 
         include_raw: bool = False,
         structured_kwargs: Optional[Dict[str, Any]] = None,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+        caller_timeout: Optional[float] = None,
     ) -> None:
         self.scheduler = scheduler
         self.schema = schema
         self.include_raw = include_raw
         self.structured_kwargs = structured_kwargs or {}
         self.max_attempts = max_attempts
+        self.caller_timeout = validate_timeout(caller_timeout)
 
     def _structured(self, ep: EndpointState):
         return ep.client.with_structured_output(self.schema, include_raw=True, **self.structured_kwargs)
@@ -453,6 +497,7 @@ class _MultiProviderStructuredRunnable(Runnable[LanguageModelInput, Union[Dict, 
             max_attempts=self.max_attempts,
             phase=_phase_from_config(config),
             usage_of=_usage_of_structured,
+            caller_timeout=self.caller_timeout,
         )
         return self._unwrap(raw_result)
 
@@ -468,6 +513,7 @@ class _MultiProviderStructuredRunnable(Runnable[LanguageModelInput, Union[Dict, 
             max_attempts=self.max_attempts,
             phase=_phase_from_config(config),
             usage_of=_usage_of_structured,
+            caller_timeout=self.caller_timeout,
         )
         return self._unwrap(raw_result)
 
@@ -475,6 +521,7 @@ class _MultiProviderStructuredRunnable(Runnable[LanguageModelInput, Union[Dict, 
 class MultiProviderChatLLM(BaseChatModel):
     scheduler: LLMScheduler
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
+    caller_timeout: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
 
     model_config = {"arbitrary_types_allowed": True}
 
@@ -502,6 +549,7 @@ class MultiProviderChatLLM(BaseChatModel):
             max_attempts=self.max_attempts,
             phase=_phase_from_run_manager(run_manager),
             usage_of=_usage_of_message,
+            caller_timeout=self.caller_timeout,
         )
         # Return the endpoint's message as-is so tool_calls / usage / metadata survive.
         return ChatResult(generations=[ChatGeneration(message=response)])
@@ -517,6 +565,7 @@ class MultiProviderChatLLM(BaseChatModel):
             max_attempts=self.max_attempts,
             phase=_phase_from_run_manager(run_manager),
             usage_of=_usage_of_message,
+            caller_timeout=self.caller_timeout,
         )
         return ChatResult(generations=[ChatGeneration(message=response)])
 
@@ -539,6 +588,7 @@ class MultiProviderChatLLM(BaseChatModel):
             include_raw=include_raw,
             structured_kwargs=kwargs,
             max_attempts=self.max_attempts,
+            caller_timeout=self.caller_timeout,
         )
 
     def bind_tools(
@@ -555,6 +605,7 @@ class MultiProviderChatLLM(BaseChatModel):
             tool_choice=tool_choice,
             bind_kwargs=kwargs,
             max_attempts=self.max_attempts,
+            caller_timeout=self.caller_timeout,
         )
 
     # ---- observability
@@ -575,6 +626,7 @@ def get_llm(
     limits_path: Union[str, Path, None, LimitsCatalogue] = "auto",
     request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    caller_timeout: Optional[float] = None,
     strategy: str = "priority",
     safety_margin: float = 0.0,
     cooldowns: Optional[CooldownPolicy] = None,
@@ -587,11 +639,14 @@ def get_llm(
                       that, the call fails immediately with AllEndpointsExhausted.
     request_timeout   Per-request HTTP timeout, so a hung connection can't stall a call.
     max_attempts      Most endpoints one call will try before giving up (AllAttemptsFailed).
+    caller_timeout    Optional total caller seconds, including waits and retries. Sync
+                      callers return on time; blocking SDK workers retain leases until done.
     limits_path       Model-limits YAML ("auto" = configs/model_limits.yaml if present,
                       None = disabled, or a path / LimitsCatalogue).
     strategy          "priority" (model order in config, keys balanced) or "balanced".
     safety_margin     0.1 = pre-stop at 90% of every configured limit.
     """
+    validate_timeout(caller_timeout)
     endpoints = build_endpoints(
         config,
         temperature=temperature,
@@ -602,4 +657,4 @@ def get_llm(
     )
     scheduler = LLMScheduler(endpoints, max_wait_seconds=max_wait_seconds, strategy=strategy)
     logger.info("LLM pool ready: %d endpoints\n%s", len(endpoints), describe_endpoints(endpoints))
-    return MultiProviderChatLLM(scheduler=scheduler, max_attempts=max_attempts)
+    return MultiProviderChatLLM(scheduler=scheduler, max_attempts=max_attempts, caller_timeout=caller_timeout)

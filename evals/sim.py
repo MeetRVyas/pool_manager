@@ -17,6 +17,8 @@ from evals.scenarios import Scenario
 def outcome_of(exc: BaseException) -> str:
     """What the CALLER experienced. The pools' own exception names win; otherwise classify the provider error."""
     name = type(exc).__name__
+    if name == "CallerDeadlineExceeded":
+        return "deadline_exceeded"
     if name == "AllEndpointsExhausted":
         return "exhausted"
     if name == "AllAttemptsFailed":

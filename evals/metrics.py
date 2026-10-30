@@ -68,7 +68,8 @@ def summarize(results: list[CallResult], counters: dict, max_accepted: float) ->
         "ratelimit_failure_rate": rate("exhausted") + rate("attempts_failed") + rate("leaked_429"),
         "attempts_failed_other_rate": rate("attempts_failed_other"),   # all attempts hit outages / dead keys
         "leaked_5xx_rate": rate("leaked_5xx"),
-        "other_fail_rate": rate("leaked_auth") + rate("other"),
+        "other_fail_rate": rate("leaked_auth") + rate("other") + rate("deadline_exceeded"),
+        "deadline_exceeded_rate": rate("deadline_exceeded"),
         # ---- efficiency: how much provider traffic was wasted on rejections
         "clean_success_rate": sum(1 for r in ok if r.ctx.r429 + r.ctx.s5xx + r.ctx.auth == 0) / n if n else 0.0,
         "provider_429_per_100_calls": 100.0 * sum(r.ctx.r429 for r in results) / n if n else 0.0,
